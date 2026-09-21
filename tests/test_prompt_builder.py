@@ -32,10 +32,27 @@ def test_build_multi_doc_switches_to_compare_prompt():
     assert "[b.pdf | Page 1]" in messages[-1]["content"]
 
 
-def test_build_always_forces_english_response():
+def test_build_answers_in_the_questions_language():
+    """The prompt used to hard-force English ("Always respond in English"),
+    which is wrong for a Russian corpus: the answer must follow the
+    question's language, not the corpus's or the prompt author's."""
     pb = PromptBuilder()
     messages = pb.build(query="q", chunks=[_chunk("x")])
-    assert "Always respond in English" in messages[0]["content"]
+    system = messages[0]["content"]
+    assert "Always respond in English" not in system
+    assert "same language the question is written in" in system
+
+
+def test_build_keeps_a_russian_question_intact():
+    """Regression for the Russian path: the question reaches the prompt
+    verbatim (no transliteration/escaping of Cyrillic), so the model has
+    the language signal rule 5 tells it to follow."""
+    pb = PromptBuilder()
+    question = "Какие основные сущности есть в ISMT?"
+    messages = pb.build(query=question, chunks=[_chunk("Сущности системы ISMT: резервуар, датчик, концентратор.")])
+    user_content = messages[-1]["content"]
+    assert f"<question>{question}</question>" in user_content
+    assert "резервуар" in user_content
 
 
 def test_context_budget_truncates_when_chunks_exceed_max_chars():

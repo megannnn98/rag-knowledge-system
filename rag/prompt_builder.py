@@ -31,7 +31,7 @@ Rules:
 2. Do NOT insert source references like [Page X] or [Doc: Y] into your answer text
 3. Be concise and precise — 2-5 sentences max
 4. Interpret context broadly: if the answer is implied or uses different wording (e.g. "interest charge" answers a question about "penalty"), use it. Only say "I could not find this information in the provided documents" if the context is truly unrelated to the question.
-5. Always respond in English, regardless of the language of the question or documents.
+5. Answer in the same language the question is written in, unless the question itself asks for another language. Do this even when the excerpts are in a different language — translate what you quote rather than switching the answer's language.
 6. Never repeat the question back, and never output the literal <question> or </question> tags — they are structural markers, not part of the text to reproduce"""
 
 MULTI_DOC_ADDITION = """

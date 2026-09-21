@@ -8,9 +8,9 @@
 
 ## What It Does
 
-Upload PDF documents, organize them into folders, and ask questions in natural language. The system finds the most relevant passages and generates a cited answer using a local LLM by default — no data leaves your machine unless an administrator has explicitly enabled the DeepSeek cloud provider (`ENABLE_CLOUD_GENERATOR=true`).
+Upload PDF documents or sync a Confluence space, organize them into folders, and ask questions in natural language. The system finds the most relevant passages and generates a cited answer using a local LLM by default — no data leaves your machine unless an administrator has explicitly enabled the DeepSeek cloud provider (`ENABLE_CLOUD_GENERATOR=true`).
 
-Built for English-language documents.
+Works on English and Russian documents: embeddings and reranking are multilingual, the sparse/BM25 tokenizer is Unicode-aware, and answers come back in the language the question was asked in.
 
 ---
 
@@ -41,10 +41,10 @@ The same standard was applied to the engineering side, not just retrieval qualit
 ### Retrieval Pipeline
 - **Hybrid search** — vector (semantic) + BM25-style sparse (keyword) combined, fused **server-side in Qdrant** via RRF — no client-side keyword index to rebuild or desync across replicas
 - **Query expansion** — LLM decomposes complex questions into sub-queries automatically; short queries skip expansion for speed
-- **Cross-encoder reranking** — `ms-marco-MiniLM-L-6-v2` re-scores candidates for precision
+- **Cross-encoder reranking** — `BAAI/bge-reranker-v2-m3` (multilingual) re-scores candidates for precision
 - **Neighbor expansion** — adjacent chunks added for context around top hits
 - **Multi-document guarantee** — retrieval ensures all relevant documents are represented in results
-- **Relevance threshold** — queries whose best post-rerank cross-encoder score (a raw logit, not a 0–1 cosine similarity — see `RELEVANCE_THRESHOLD` below) falls below `3.0` return "not found" instead of hallucinating
+- **Relevance threshold** — queries whose best post-rerank cross-encoder score (a 0–1 sigmoid relevance probability — see `RELEVANCE_THRESHOLD` below) falls below `0.1` return "not found" instead of hallucinating
 
 ### Document Viewer
 - Inline source viewer highlights the exact cited passage via stored char offsets — no text search against a rendered page, so it works identically for TXT and PDF (including OCR'd pages)
@@ -110,6 +110,11 @@ Query → Expand (Ollama LLM) → Retrieve (Qdrant hybrid: dense + sparse, serve
 | `rag/query_expander.py` | LLM-powered query decomposition |
 | `rag/prompt_builder.py` | Context assembly, token budgets, multi-doc mode |
 | `rag/generator.py` | Ollama streaming client with retry logic; `GeneratorRouter` also routes non-streaming requests to an optional, opt-in DeepSeek cloud generator |
+| `api/ingest.py` | `ingest_parsed_document()` — the one chunk/embed/upsert/persist path, shared by uploads and Confluence sync |
+| `api/confluence.py` | `POST /confluence/sync` + the space-sync logic (identity, change detection, deletion) |
+| `ingestion/confluence/client.py` | Confluence REST: Basic Auth, pagination, retry |
+| `ingestion/confluence/parser.py` | Confluence Storage Format -> text |
+| `ingestion/confluence/adapter.py` | Confluence page -> `ParsedDocument` |
 | `ingestion/pdf_parser.py` | PyMuPDF text extraction + Tesseract OCR fallback |
 | `ingestion/chunker.py` | Sentence/paragraph-aware chunking |
 | `embeddings/embedding_service.py` | BAAI/bge-m3 embeddings (CUDA) |
@@ -185,7 +190,151 @@ TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 uvicorn api.main:app --host 127.0.0
 ```
 Also loopback only — plain HTTP, no TLS. For access beyond localhost, put a TLS-terminating reverse proxy in front of it instead of widening this bind.
 
-Open **http://localhost:8000/app**
+Open the Web UI at **http://localhost:8000/app** (interactive API docs: **http://localhost:8000/docs**).
+
+---
+
+## Running a second, isolated stack (`local/`)
+
+`local/` holds an alternative launch path for running this stack on a machine
+that already has a PostgreSQL/Qdrant of its own: different container names,
+different host ports, and credentials kept in gitignored env files instead of
+in the repo. Use it instead of steps 1/3/5 above when you need that isolation;
+the plain `.env` route above still works unchanged.
+
+```bash
+cp local/infra.env.example local/infra.env      # set POSTGRES_PASSWORD / QDRANT_API_KEY
+docker compose -p rag-knowledge-system --env-file local/infra.env \
+  -f docker/docker-compose.yml -f local/docker-compose.override.yml up -d qdrant postgres
+./local/run_api.sh                               # reads local/infra.env, starts uvicorn on :8000
+```
+
+| Service | Default port here | Instead of |
+|---------|-------------------|------------|
+| PostgreSQL (`rks_postgres`) | 55433 | 5432 |
+| Qdrant HTTP / gRPC (`rks_qdrant`) | 6335 / 6336 | 6333 / 6334 |
+| FastAPI + Web UI | 8000 | 8000 |
+| Ollama | 11434 | 11435 |
+
+`local/ru_eval/` holds the scripts used to calibrate `RELEVANCE_THRESHOLD`
+(`calibrate_reranker.py` over `calibration_pairs.json`) and to trace a query
+stage by stage (`trace_queries.py` — expansion, dense, sparse, RRF, reranker,
+threshold, context, answer, sources).
+
+---
+
+## Confluence ingestion
+
+A Confluence space can be synced into the same knowledge base as uploaded
+files. There is **no separate retrieval path** for it: a synced page becomes an
+ordinary `ParsedDocument` and from there travels the same pipeline a PDF does.
+
+```
+Confluence REST API
+  -> ConfluenceClient          Basic Auth, start/_links.next pagination, retry on 429/5xx
+  -> ConfluenceHtmlParser      Storage Format -> text (ac:parameter and ri:* dropped,
+                               ac:rich-text-body descended into, ac:plain-text-body as code,
+                               tables -> "a | b | c", lists -> "- item")
+  -> ParsedDocument            title becomes `filename`, so chunk_context_text() prefixes it
+                               onto every chunk and the title participates in retrieval
+  -> SmartChunker              the same chunker uploads use
+  -> BAAI/bge-m3               the same embeddings
+  -> Qdrant dense + sparse     the same collection, server-side RRF fusion
+  -> BAAI/bge-reranker-v2-m3   the same reranker
+  -> Ollama (LLM_MODEL)        the same generator, cited back to the page's URL
+```
+
+### Models used
+
+| Role | Model | Set by |
+|------|-------|--------|
+| Embeddings | `BAAI/bge-m3` (1024-dim, XLM-R tokenizer — multilingual, handles Russian) | `EMBEDDING_MODEL` |
+| Reranking | `BAAI/bge-reranker-v2-m3` (cross-encoder, 0–1 sigmoid score) | `RERANKER_MODEL` |
+| Generation / query expansion | `qwen2.5:7b` by default; the `local/` stack runs `qwen3:8b` | `LLM_MODEL`, `QUERY_EXPANDER_MODEL` |
+
+Sparse (BM25-style) vectors are built in-process by `vector_db/sparse_encoder.py`
+with a Unicode-aware tokenizer, so Cyrillic text and hyphenated identifiers
+(`A016ISMT-901`, indexed whole and in parts) produce real sparse terms rather
+than an empty vector.
+
+### Configuration
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CONFLUENCE_URL` | yes | Base URL, e.g. `https://confluence.your-company.example` |
+| `CONFLUENCE_USERNAME` | yes | Account the sync authenticates as |
+| `CONFLUENCE_PASSWORD` | one of the two | Password for Basic Auth |
+| `CONFLUENCE_API_TOKEN` | one of the two | Accepted instead of the password |
+| `CONFLUENCE_SPACE` | no | Default space key for `POST /confluence/sync` and the CLI |
+
+With the `local/` launch path, put them in `local/confluence.env` (gitignored,
+sourced by `local/run_api.sh`) rather than on a command line, so they never
+reach shell history:
+
+```bash
+cp local/confluence.env.example local/confluence.env
+$EDITOR local/confluence.env
+```
+
+Credentials are never logged: client errors carry the URL and status code
+only, and `tests/test_confluence_client.py` asserts that neither log records
+nor exception messages contain the secret in any form.
+
+### Syncing a space
+
+```bash
+./venv/bin/python scripts/sync_confluence.py --space AISMT
+```
+
+Equivalently `POST /confluence/sync {"space_key": "AISMT"}`. The CLI is a thin
+HTTP client on purpose: the API process holds a Postgres advisory lock (see
+`lock.py`) and already has the models loaded, so a second ingesting process
+would be both refused that lock and a wasted copy of them in VRAM.
+
+The **first** run indexes the space:
+
+```json
+{"space": "AISMT", "remote_pages": 35, "added": 26, "updated": 0, "unchanged": 0,
+ "deleted": 0, "skipped_empty": 9, "failed": 0, "chunks_indexed": 176, "duration_s": 14.3}
+```
+
+**Re-running the same command** is the incremental sync — same command, no
+flags. It is idempotent: with nothing changed upstream it performs zero writes
+and does not even download the page bodies, because the space listing carries
+each page's `version`.
+
+```json
+{"space": "AISMT", "remote_pages": 35, "added": 0, "updated": 0, "unchanged": 26,
+ "deleted": 0, "skipped_empty": 9, "failed": 0, "chunks_indexed": 0, "duration_s": 3.5}
+```
+
+Per page, a re-sync resolves to exactly one of:
+
+| Upstream state | What happens |
+|----------------|--------------|
+| version unchanged | skipped, body never fetched |
+| new page | indexed |
+| version changed | the old document is **deleted first**, then re-ingested |
+| page gone | local document, chunks and vectors deleted |
+| no indexable text (diagram-only or shorter than the chunker's minimum) | counted in `skipped_empty`, not an error |
+
+Deleting before re-ingesting is what keeps stale vectors out: point IDs are
+derived from the chunk id, so an in-place upsert of a page that shrank from 5
+chunks to 3 would overwrite 3 and silently leave the other 2 behind forever
+(`tests/test_confluence_sync.py::test_shrinking_page_leaves_no_stale_vectors`).
+
+Identity is `confluence:<page_id>`, never a content hash — an edited page has
+to stay the same document, and two pages with identical text must not collapse
+into one.
+
+`--limit N` syncs only the first N pages and, deliberately, deletes nothing: a
+partial listing cannot prove a page is gone.
+
+### Citations
+
+A synced page's citations carry its title, excerpt, relevance score and the
+original page URL, and clicking one opens Confluence rather than the local text
+viewer — there is no local file behind a synced page to view.
 
 ---
 
@@ -197,9 +346,9 @@ All settings in `.env`:
 |----------|---------|-------------|
 | `LLM_MODEL` | `qwen2.5:7b` | Ollama model name |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | HuggingFace embedding model |
-| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker model |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Reranker model (multilingual; the previous `cross-encoder/ms-marco-MiniLM-L-6-v2` is English-only and scores Russian as confident noise) |
 | `QUERY_EXPANDER_MODEL` | `qwen2.5:7b` | Model for query expansion |
-| `RELEVANCE_THRESHOLD` | `3.0` | Minimum cross-encoder rerank score to attempt an answer — a raw logit (calibrated on golden_dataset.json, see the comment above it in `api/main.py`), **not** a 0–1 cosine similarity |
+| `RELEVANCE_THRESHOLD` | `0.1` | Minimum cross-encoder rerank score to attempt an answer — a **0–1 sigmoid probability** on the current reranker (calibrated on `local/ru_eval/calibration_pairs.json`, see the comment above it in `api/main.py`). The old `3.0` belonged to ms-marco's unbounded logit scale and would refuse every query on this model |
 | `top_k` | `5` (per request, `1`–`20`) | Chunks kept after rerank — a `/query` request field, not an env var; there's no `TOP_K_RESULTS` setting |
 | `MAX_CHUNK_SIZE` | `512` | Characters per chunk |
 | `CHUNK_OVERLAP` | `50` | Overlap between chunks |
@@ -227,6 +376,7 @@ Key endpoints:
 |--------|------|-------------|
 | `POST` | `/upload` | Upload a single PDF |
 | `POST` | `/upload-batch` | Upload multiple PDFs to a folder |
+| `POST` | `/confluence/sync` | Sync a Confluence space (idempotent; see *Confluence ingestion*) |
 | `POST` | `/query` | Single-shot Q&A (JSON response) |
 | `POST` | `/query/stream` | Streaming Q&A (SSE) |
 | `GET` | `/documents` | List all documents |
@@ -339,7 +489,7 @@ BM25 is ideal for exact keyword matching but misses paraphrased questions.
 - *"article 15.1 clause 3"* → BM25 finds it instantly; vector often ranks it 10–20th
 
 **Solution**: hybrid with RRF-style merging.
-Both searches run in parallel → rankings merged → cross-encoder reranks (ms-marco-MiniLM-L-6-v2).
+Both searches run in parallel → rankings merged → cross-encoder reranks (bge-reranker-v2-m3).
 On my test datasets (legal contracts + technical docs), hybrid + rerank delivers **+18–27% nDCG@5** and **+12–19% Recall@5** vs. pure dense or pure BM25.
 
 **Implementation note**: the sparse side originally ran as an in-process `rank_bm25` index, rebuilt from scratch on every upload and restart — fine at demo scale, but it doesn't survive a growing library or multiple API replicas. It now runs as a native Qdrant sparse vector (`Modifier.IDF`), fused with the dense vector server-side in a single `query_points` call — same hybrid retrieval behavior, but the corpus-wide term statistics are maintained incrementally by Qdrant itself instead of rebuilt client-side.
@@ -422,7 +572,7 @@ The fix follows the same shape as the process-lock story above: write a durable 
 - **PostgreSQL** — document metadata (Docker)
 - **Ollama** — local LLM inference
 - **BAAI/bge-m3** — embeddings (1024-dim)
-- **CrossEncoder ms-marco-MiniLM-L-6-v2** — reranking
+- **CrossEncoder BAAI/bge-reranker-v2-m3** — multilingual reranking
 - **Qdrant sparse vectors (BM25-style, `Modifier.IDF`)** — keyword retrieval, fused server-side with dense search
 - **PyMuPDF** — PDF text extraction
 - **Tesseract** — OCR for scanned pages

@@ -71,3 +71,10 @@ eval/**/title_free_retrieval_check*.json
 # the summary table is in eval/mixed_corpus/README.md's "Golden-dataset
 # v3" section.
 eval/**/rescore_v3_report.json
+# Local deployment scaffolding that must never be committed:
+#   *.env          — Postgres/Qdrant/Confluence credentials (see the .example files)
+#   ru_eval/corpus — synthetic RU/EN documents used to smoke-test retrieval by hand
+#   calibration_scores.json — regenerable output of local/ru_eval/calibrate_reranker.py
+local/*.env
+local/ru_eval/corpus/
+local/ru_eval/calibration_scores.json

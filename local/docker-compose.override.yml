@@ -1,0 +1,12 @@
+# Port/name remap so this stack never collides with the older integra-rag
+# stack (PostgreSQL 55432, Qdrant 6334) running on the same host.
+services:
+  qdrant:
+    container_name: rks_qdrant
+    ports:
+      - "127.0.0.1:6335:6333"
+      - "127.0.0.1:6336:6334"
+  postgres:
+    container_name: rks_postgres
+    ports:
+      - "127.0.0.1:55433:5432"

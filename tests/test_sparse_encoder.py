@@ -76,3 +76,31 @@ def test_build_sparse_vector_no_index_collisions_for_distinct_tokens():
     tokens = tokenize("article clause contract statute penalty jurisdiction remedy breach")
     indices = [build_sparse_vector(t).indices[0] for t in tokens]
     assert len(set(indices)) == len(Counter(tokens))
+
+
+def test_tokenize_keeps_cyrillic():
+    """The old ASCII-only regex deleted every Cyrillic character before
+    splitting, so a Russian query produced an empty sparse vector and
+    hybrid search silently fell back to dense-only."""
+    tokens = tokenize("пороговое значение уровня жидкости")
+    assert tokens == ["пороговое", "значение", "уровня", "жидкости"]
+
+
+def test_build_sparse_vector_russian_query_is_not_empty():
+    sv = build_sparse_vector("Какие основные сущности есть в ISMT?")
+    assert len(sv.indices) == 5  # какие, основные, сущности, есть, ismt
+
+
+def test_tokenize_mixed_russian_english_keeps_both():
+    tokens = tokenize("Отчёт Customer Daily Report по ISMT")
+    assert "отчёт" in tokens
+    assert "ismt" in tokens
+    assert "daily" in tokens
+
+
+def test_tokenize_hyphenated_identifier_indexes_whole_and_parts():
+    """A016ISMT-901 must be findable whether the query writes the full
+    identifier or only its leading part."""
+    tokens = tokenize("A016ISMT-901")
+    assert tokens == ["a016ismt-901", "a016ismt", "901"]
+    assert set(tokenize("A016ISMT")) & set(tokens)

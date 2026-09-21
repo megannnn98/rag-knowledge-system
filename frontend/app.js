@@ -320,7 +320,14 @@ document.addEventListener('click', function(e) {
   if (srcEl) {
     var s = _sourcesStore[parseInt(srcEl.dataset.src, 10)];
     if (s) {
-      openTextViewer(s.document, s.page || 1, s.char_start, s.char_end);
+      // A Confluence page has no local file or stored PDF behind it — the
+      // authoritative copy is the page itself, so send the user there
+      // instead of into the text viewer.
+      if (s.url) {
+        window.open(s.url, '_blank', 'noopener,noreferrer');
+      } else {
+        openTextViewer(s.document, s.page || 1, s.char_start, s.char_end);
+      }
     }
   }
 
@@ -1103,14 +1110,20 @@ function buildSourcesColumn(sources) {
   sources.forEach(function(s, i) {
     const idx = baseIdx + i;
     const doc = Object.values(docsData).find(function(x){ return x.doc_id === s.document; }) || {};
-    const fname = doc.filename ? doc.filename.replace(/\.pdf$/i, '') : (s.document || '?');
+    // s.title comes from the answer's own sources payload, so a Confluence
+    // page still shows its real title when docsData hasn't been refreshed
+    // since the last sync.
+    const rawName = doc.filename || s.title || s.document || '?';
+    const fname = rawName.replace(/\.pdf$/i, '');
+    const isLink = !!s.url;
     html += '<div class="source-card" data-src="' + idx + '" role="button" tabindex="0">';
     html += '<div class="source-num">' + (i + 1) + '</div>';
     html += '<div class="source-body">';
-    html += '<div class="source-top"><span class="source-filename" title="' + esc(doc.filename || '') + '">' + esc(fname) + '</span>';
-    html += '<span class="source-page">p.' + (s.page || '?') + '</span></div>';
+    html += '<div class="source-top"><span class="source-filename" title="' + esc(rawName) + '">' + esc(fname) + '</span>';
+    html += isLink ? '' : '<span class="source-page">p.' + (s.page || '?') + '</span>';
+    html += '</div>';
     html += '<div class="source-excerpt">' + esc(s.excerpt || '') + '</div>';
-    html += '<div class="source-open">' + svgIcon('external-link', 11) + ' Open document</div>';
+    html += '<div class="source-open">' + svgIcon('external-link', 11) + (isLink ? ' Open in Confluence' : ' Open document') + '</div>';
     html += '</div></div>';
   });
   html += '</div>';

@@ -44,6 +44,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _source_origin(doc_id: str) -> dict:
+    """Extra citation fields that depend on where a document CAME from.
+
+    Resolved here from the document registry rather than stored on every
+    chunk's Qdrant payload: a page's URL or title can change without its text
+    changing, and putting it in the payload would mean re-embedding the whole
+    document to correct a link. Every document contributes `title`; a
+    Confluence page also contributes `url`, which is what lets the UI open the
+    real page instead of the local text viewer (there is no local file behind
+    a synced page to view)."""
+    import api.main as m
+
+    doc = m.documents_registry.get(doc_id) or {}
+    meta = doc.get("metadata") or {}
+    origin = {"title": doc.get("filename", ""), "source": meta.get("source", "upload")}
+    if meta.get("source") == "confluence" and meta.get("confluence_url"):
+        origin["url"] = meta["confluence_url"]
+    return origin
+
+
 def _augment_compare_queries(expanded_queries: list[str], document_ids: list[str] | None) -> list[str]:
     # query_expander.expand() decomposes within an 80-token LLM budget — for
     # a "compare A, B, C" question that spells out every filename plus
@@ -222,6 +242,7 @@ async def _do_query(request: QueryRequest, scope_document_ids, query_expander, r
                 "relevance_score": round(score, 3),
                 "char_start": c.get("char_start"),
                 "char_end": c.get("char_end"),
+                **_source_origin(doc_id),
             }
     sources = sorted(seen_docs.values(), key=lambda x: x["relevance_score"], reverse=True)
 
@@ -463,6 +484,7 @@ async def query_stream(
                         "relevance_score": round(score, 3),
                         "char_start": c.get("char_start"),
                         "char_end": c.get("char_end"),
+                        **_source_origin(doc_id),
                     }
             sources = sorted(seen_docs.values(), key=lambda x: x["relevance_score"], reverse=True)
 

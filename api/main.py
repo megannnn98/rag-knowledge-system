@@ -12,7 +12,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from api import documents, health, upload
+from api import confluence, documents, health, upload
 from api.documents import (
     _active_chunks,
     _get_active_document,
@@ -122,25 +122,35 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # into the wrapped generator's own `finally` (see api/documents.py's
 # _require_not_backing_up docstring for the full reasoning).
 
-# Minimum cross-encoder rerank score (raw logit, NOT 0-1 cosine similarity —
-# ms-marco-MiniLM-L-6-v2 outputs unbounded relevance logits) to attempt an
-# answer. Below this, the knowledge base is considered to have no relevant
-# content. Checked AFTER reranking, not on the raw hybrid/RRF retrieval
+# Minimum cross-encoder rerank score to attempt an answer. Below this, the
+# knowledge base is considered to have no relevant content.
+#
+# SCALE CHANGED with the reranker: bge-reranker-v2-m3 emits a sigmoid
+# relevance probability in [0, 1], not ms-marco's unbounded logit, so the
+# old 3.0 would have refused EVERY query outright (no score can reach it).
+# Recalibrated on local/ru_eval/calibration_pairs.json (23 RU/EN pairs
+# covering ru->ru, ru->en, en->en, en->ru and relevant/partial/irrelevant):
+# genuinely relevant passages scored 0.941-1.000, everything the model
+# judged unrelated scored 0.000-0.017. 0.1 sits inside that empty gap with
+# ~6x margin above the worst non-relevant and ~9x below the worst true
+# relevant, and is deliberately the permissive end of the gap — a false
+# refusal costs more here than one weak excerpt reaching the generator.
+# Re-run local/ru_eval/calibrate_reranker.py after changing the reranker
+# model; the English eval/run_eval.py datasets are scored on the OLD scale
+# and their 3.0-era numbers are not comparable.
+#
+# Checked AFTER reranking, not on the raw hybrid/RRF retrieval
 # score — RRF is a rank-fusion formula (Qdrant docs: reciprocal-rank sum,
 # not a similarity measure) and gets further boosted by retriever.py's
 # multi-query merge logic, so it was never on an interpretable 0-1 scale to
 # begin with.
 #
-# Recalibrated after chunk_context_text() (title-prefixed passages) was
-# wired into reranker.rerank() — that change pushed every should-answer
-# type's score up together, not just case_summary's, so a single global
-# threshold still suffices; per-type thresholds turned out unnecessary (see
-# eval/README.md). Measured on golden_dataset.json + heldout_dataset.json
-# combined (220 cases): should-refuse scores topped out at 1.00, should-
-# answer scores bottomed out at 4.94 — 3.0 sits at the midpoint of that gap,
-# not hugging either edge. Re-run eval/run_eval.py on both datasets after
-# changing chunk_size, the reranker model, or the dataset composition.
-RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "3.0"))
+# History, for anyone reading eval/README.md: the previous value (3.0) was
+# calibrated the same way on golden_dataset.json + heldout_dataset.json (220
+# English cases, should-refuse topping out at 1.00 against should-answer
+# bottoming out at 4.94) for ms-marco's logits. Same method, different model,
+# different scale — a single global threshold still suffices either way.
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.1"))
 MAX_CONCURRENT_QUERIES = int(os.getenv("MAX_CONCURRENT_QUERIES", "3"))
 _query_semaphore = asyncio.Semaphore(MAX_CONCURRENT_QUERIES)
 
@@ -223,8 +233,8 @@ _metadata_mutation_lock = _ReentrantAsyncLock()
 # whole file read into RAM regardless of size, no cap on how many files one
 # batch request could contain, and no cap on PDF page count (so OCR time
 # scaled with an attacker/mistake-controlled input). MAX_CONCURRENT_
-# INGESTIONS (bounding parse/OCR/embed concurrency) lives in api/upload.py
-# now, self-contained — nothing else references it.
+# INGESTIONS (bounding parse/OCR/embed concurrency) lives in api/ingest.py
+# now, shared by uploads and Confluence sync.
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "20"))
@@ -851,7 +861,7 @@ async def startup():
         )
         retriever = HybridRetriever(embedder, vector_store)
         try:
-            reranker = CrossEncoderReranker(model_name=os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
+            reranker = CrossEncoderReranker(model_name=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"))
         except Exception as e:
             logger.warning(f"CrossEncoderReranker failed to load ({e}), falling back to SimpleReranker")
             reranker = SimpleReranker()
@@ -1009,6 +1019,7 @@ async def shutdown():
 # /health* are deliberately public — hence two routers per module rather
 # than one, see each module's own docstring for why.
 protected.include_router(upload.router)
+protected.include_router(confluence.router)
 protected.include_router(query.router)
 protected.include_router(documents.protected_router)
 protected.include_router(health.protected_router)

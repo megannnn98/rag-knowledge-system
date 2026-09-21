@@ -15,11 +15,17 @@ and tests do `monkeypatch.setattr(api.main, "X", fake)` against the
 `api.main` module object itself — a binding captured once at import time
 elsewhere would freeze at whatever value existed then.
 
-`_ingestion_semaphore`/`_active_ingestions`/`MAX_CONCURRENT_INGESTIONS`/
-`_FORMAT_MAGIC_BYTES` are the one exception: nothing outside this file (and
-nothing in the test suite) ever touches them, so they're defined here
-directly rather than staying in api/main.py behind a lazy lookup — genuinely
+`_FORMAT_MAGIC_BYTES` is the one exception: nothing outside this file (and
+nothing in the test suite) ever touches it, so it's defined here directly
+rather than staying in api/main.py behind a lazy lookup — genuinely
 self-contained, unlike everything else in this module.
+
+Chunking, embedding, the Qdrant upsert and the Postgres commit are NOT here:
+they moved to api/ingest.py when Confluence sync became a second source of
+ParsedDocuments, so both sources run the same code (see that module).
+MAX_CONCURRENT_INGESTIONS and the ingestion slot moved with them, since the
+semaphore now has to bound uploads and syncs together rather than uploads
+alone.
 
 The backup-exclusion dependency (`Depends(require_not_backing_up)`) below
 comes from `api/dependencies.py`, shared with api/documents.py — it has
@@ -27,7 +33,6 @@ zero dependency on api.main's state, so both modules import the same
 implementation directly rather than each keeping their own copy.
 """
 import asyncio
-import contextlib
 import hashlib
 import os
 import time
@@ -40,23 +45,13 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from api.dependencies import require_not_backing_up
-from ingestion.chunker import chunk_context_text
-from rag.executors import run_on_gpu
+from api.ingest import ingest_parsed_document, ingestion_slot
 
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# Upload/ingestion limits. MAX_CONCURRENT_INGESTIONS only needs to be small
-# — embedding is already serialized onto one GPU worker by run_on_gpu
-# (rag/executors.py), but PDF parsing/OCR is CPU-bound and runs via plain
-# asyncio.to_thread, so nothing else limits how many of those could run in
-# parallel without this.
-MAX_CONCURRENT_INGESTIONS = int(os.getenv("MAX_CONCURRENT_INGESTIONS", "2"))
-_ingestion_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INGESTIONS)
-_active_ingestions = 0  # only ever mutated between an `await` boundary and the next, see _ingestion_slot() — safe without a separate lock under asyncio's single-threaded cooperative scheduling
 
 # Every supported format needs an entry here for the streaming upload
 # helper (below) to reject an obvious mismatch (a renamed .exe as
@@ -66,24 +61,6 @@ _active_ingestions = 0  # only ever mutated between an `await` boundary and the 
 # labeling convention, not a format PyMuPDF or anything else parses
 # structurally, so there is nothing meaningful to check.
 _FORMAT_MAGIC_BYTES = {"pdf": b"%PDF-"}
-
-
-@contextlib.asynccontextmanager
-async def _ingestion_slot(doc_id: str):
-    """Wraps _ingestion_semaphore with observability: logs how many
-    ingestion jobs are actually concurrently in this block right now, not
-    just that a semaphore object exists — the thing worth being able to
-    verify from logs under real concurrent load, not just trust from
-    reading the semaphore size."""
-    global _active_ingestions
-    async with _ingestion_semaphore:
-        _active_ingestions += 1
-        logger.info(f"Ingestion slot acquired for {doc_id} ({_active_ingestions}/{MAX_CONCURRENT_INGESTIONS} in use)")
-        try:
-            yield
-        finally:
-            _active_ingestions -= 1
-            logger.info(f"Ingestion slot released for {doc_id} ({_active_ingestions}/{MAX_CONCURRENT_INGESTIONS} in use)")
 
 
 def _validate_signature(doc_format: str, header: bytes) -> bool:
@@ -245,8 +222,8 @@ async def upload_document(file: UploadFile = File(...), folder: str = Form("")):
         existing = m.documents_registry.get(existing_id, {})
         raise HTTPException(409, f"File already uploaded as '{existing.get('filename', existing_id)}' (id: {existing_id})")
 
-    # Everything from here through the Qdrant upsert is one unit: any
-    # failure — parse, chunk, embed, or upsert — must leave neither an
+    # Everything from here through the Postgres commit is one unit: any
+    # failure — parse, chunk, embed, upsert or save — must leave neither an
     # orphaned file nor orphaned Qdrant points behind, so it's all one
     # try/except around _rollback_upload rather than the empty-chunks case
     # having its own bespoke cleanup and everything else having none.
@@ -255,25 +232,21 @@ async def upload_document(file: UploadFile = File(...), folder: str = Form("")):
     # run_on_gpu, but nothing previously capped how many uploads could be
     # parsing/OCR-ing in parallel via plain asyncio.to_thread.
     try:
-        async with _ingestion_slot(doc_id):
+        async with ingestion_slot(doc_id):
             t_parse = time.time()
             parsed = await asyncio.to_thread(doc_parser.parse, str(file_path))
             parse_ms = int((time.time() - t_parse) * 1000)
-            chunks = m.chunker.chunk_document(parsed.pages, doc_id)
-
-            if not chunks:
-                raise ValueError("Could not extract text from document")
-
-            for c in chunks:
-                c.filename = safe_filename
-                c.pages = parsed.total_pages
-                c.folder = folder or ""
-
-            texts = [chunk_context_text(c) for c in chunks]
-            t_embed = time.time()
-            vectors = await run_on_gpu(m.embedder.embed_batch, texts)
-            embed_ms = int((time.time() - t_embed) * 1000)
-            await asyncio.to_thread(m.vector_store.upsert_chunks, chunks, vectors)
+            t_ingest = time.time()
+            doc_meta = await ingest_parsed_document(
+                parsed,
+                doc_id=doc_id,
+                filename=safe_filename,
+                folder=folder,
+                doc_format=doc_format,
+                identity_key=file_hash,
+            )
+            embed_ms = int((time.time() - t_ingest) * 1000)
+            chunks_created = doc_meta["chunks"]
     except asyncio.CancelledError:
         # CancelledError does NOT subclass Exception (since Python 3.8) —
         # a client disconnect or server shutdown cancelling this task while
@@ -288,6 +261,17 @@ async def upload_document(file: UploadFile = File(...), folder: str = Form("")):
     except ValueError as e:
         await _rollback_upload(doc_id, file_path)
         raise HTTPException(422, str(e))
+    except m.DuplicateFileHashError:
+        # Raised by db_save_ingestion() inside ingest_parsed_document() when
+        # a concurrent upload of identical content committed the same
+        # file_hash first — see that function's concurrency note. Must be
+        # caught BEFORE the generic Exception clause below, which would
+        # otherwise report this as a 500.
+        logger.warning(f"Concurrent upload race for {doc_id} (file_hash already claimed) — discarding this attempt")
+        await _rollback_upload(doc_id, file_path)
+        existing_id = m.file_hashes.get(file_hash)
+        existing = m.documents_registry.get(existing_id, {}) if existing_id else {}
+        raise HTTPException(409, f"File already uploaded as '{existing.get('filename', existing_id or file_hash)}'")
     except Exception as e:
         logger.error(f"Ingestion failed for {doc_id} ({safe_filename}): {e}")
         await _rollback_upload(doc_id, file_path)
@@ -296,57 +280,24 @@ async def upload_document(file: UploadFile = File(...), folder: str = Form("")):
     ocr_pages = sum(1 for p in parsed.pages if p.get("has_ocr"))
     logger.info(
         f"Ingestion: {safe_filename} | pages={parsed.total_pages} ocr={ocr_pages} "
-        f"chunks={len(chunks)} parse_ms={parse_ms} embed_ms={embed_ms}"
+        f"chunks={chunks_created} parse_ms={parse_ms} embed_ms={embed_ms}"
     )
     if m.LANGFUSE_ENABLED:
         try:
             m.langfuse.trace(name="doc_ingestion", input=safe_filename, tags=["upload"],
                            metadata={"doc_id": doc_id, "pages": parsed.total_pages,
-                                     "ocr_pages": ocr_pages, "chunks": len(chunks),
+                                     "ocr_pages": ocr_pages, "chunks": chunks_created,
                                      "size_kb": parsed.file_size_kb, "folder": folder or "",
                                      "parse_ms": parse_ms, "embed_ms": embed_ms})
             m.langfuse.flush()
         except Exception:
             pass
 
-    doc_meta = {
-        "doc_id": doc_id,
-        "filename": safe_filename,
-        "pages": parsed.total_pages,
-        "chunks": len(chunks),
-        "size_kb": parsed.file_size_kb,
-        "metadata": parsed.metadata,
-        "folder": folder or "",
-        "format": doc_format,
-    }
-    # file_hashes/folders_registry/documents_registry are only updated in
-    # memory AFTER db_save_ingestion() commits — updating them earlier (the
-    # old code set file_hashes[file_hash] before this could even fail) left
-    # a hash entry with nothing behind it if the save failed: every retry
-    # of the same file then hit the file_hash-seen check below and got a
-    # false 409, even though the document/file/Qdrant points were all gone.
-    try:
-        await asyncio.to_thread(m.db_save_ingestion, doc_meta, parsed.pages, file_hash)
-    except m.DuplicateFileHashError:
-        logger.warning(f"Concurrent upload race for {doc_id} (file_hash already claimed) — discarding this attempt")
-        await _rollback_upload(doc_id, file_path)
-        existing_id = m.file_hashes.get(file_hash)
-        existing = m.documents_registry.get(existing_id, {}) if existing_id else {}
-        raise HTTPException(409, f"File already uploaded as '{existing.get('filename', existing_id or file_hash)}'")
-    except Exception as e:
-        logger.error(f"DB save failed for {doc_id}, rolling back Qdrant points + uploaded file: {e}")
-        await _rollback_upload(doc_id, file_path)
-        raise HTTPException(500, f"Failed to save document — upload did not complete: {e}")
-    m.file_hashes[file_hash] = doc_id
-    if folder:
-        m.folders_registry.add(folder)
-    m.documents_registry[doc_id] = doc_meta
-
     return {
         "doc_id": doc_id,
         "filename": safe_filename,
         "pages": parsed.total_pages,
-        "chunks_created": len(chunks),
+        "chunks_created": chunks_created,
         "status": "indexed"
     }
 
@@ -393,41 +344,18 @@ async def upload_batch(files: list[UploadFile] = File(...), folder: str = Form("
             # Bounds concurrent CPU-bound parse/OCR + GPU-bound embed work
             # across all in-flight uploads (single + batch share the same
             # semaphore) — see MAX_CONCURRENT_INGESTIONS above.
-            async with _ingestion_slot(doc_id):
+            async with ingestion_slot(doc_id):
                 parsed = await asyncio.to_thread(doc_parser.parse, str(file_path))
-                chunks = m.chunker.chunk_document(parsed.pages, doc_id)
-
-                if not chunks:
-                    raise ValueError("Could not extract text")
-
-                for c in chunks:
-                    c.filename = safe_name
-                    c.pages = parsed.total_pages
-                    c.folder = folder or ""
-
-                texts = [chunk_context_text(c) for c in chunks]
-                vectors = await run_on_gpu(m.embedder.embed_batch, texts)
-                await asyncio.to_thread(m.vector_store.upsert_chunks, chunks, vectors)
-
-            doc_meta = {
-                "doc_id": doc_id,
-                "filename": safe_name,
-                "pages": parsed.total_pages,
-                "chunks": len(chunks),
-                "size_kb": parsed.file_size_kb,
-                "metadata": parsed.metadata,
-                "folder": folder or "",
-                "format": doc_format,
-            }
-            # file_hashes/folders_registry/documents_registry only updated in
-            # memory after a successful commit — see db_save_ingestion().
-            await asyncio.to_thread(m.db_save_ingestion, doc_meta, parsed.pages, file_hash)
-            m.file_hashes[file_hash] = doc_id
-            if folder:
-                m.folders_registry.add(folder)
-            m.documents_registry[doc_id] = doc_meta
+                doc_meta = await ingest_parsed_document(
+                    parsed,
+                    doc_id=doc_id,
+                    filename=safe_name,
+                    folder=folder,
+                    doc_format=doc_format,
+                    identity_key=file_hash,
+                )
             results.append({"doc_id": doc_id, "filename": safe_name, "status": "indexed",
-                            "pages": parsed.total_pages, "chunks_created": len(chunks)})
+                            "pages": parsed.total_pages, "chunks_created": doc_meta["chunks"]})
 
         except m.DuplicateFileHashError:
             logger.warning(f"Concurrent upload race for {doc_id} (file_hash already claimed) — discarding this attempt")

@@ -10,13 +10,24 @@ logger = logging.getLogger(__name__)
 
 
 class CrossEncoderReranker:
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
         from sentence_transformers import CrossEncoder
         self.model = CrossEncoder(model_name)
         logger.info(f"CrossEncoderReranker loaded: {model_name}")
 
     # If ALL cross-encoder scores are below this, the model can't handle the
-    # input (ms-marco is English-only) — keep vector score order instead.
+    # input at all — keep vector score order instead.
+    #
+    # Inert for the default multilingual model (bge-reranker-v2-m3 emits a
+    # sigmoid probability in [0, 1], which can never go below -5.0), and
+    # that is correct: it handles Russian natively, so there is no language
+    # it is blind to and nothing to fall back from. The constant stays for
+    # an English-only RERANKER_MODEL such as the previous
+    # cross-encoder/ms-marco-MiniLM-L-6-v2, where it does fire — though note
+    # that on Russian even ms-marco does NOT reach it: measured on
+    # local/ru_eval/calibration_pairs.json it scored Russian passages
+    # +7.2..+8.8 regardless of relevance ("рецепт борща" 8.21 above a truly
+    # relevant passage), i.e. confident nonsense that this guard never sees.
     LANGUAGE_FALLBACK_THRESHOLD = -5.0
 
     # ms-marco-MiniLM-L-6-v2's tokenizer caps a (query, passage) pair at 512

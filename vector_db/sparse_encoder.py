@@ -36,6 +36,21 @@ _HASH_BUCKETS = 2 ** 31 - 1
 _BM25_K1 = 1.2
 
 
+# Unicode-aware token pattern: runs of letters/digits in ANY script (Cyrillic
+# included), keeping internal hyphens so a technical identifier like
+# "A016ISMT-901" survives as one token instead of being cut apart.
+# The previous `re.sub(r"[^a-z0-9\s]", " ", lowered)` deleted every non-ASCII
+# character BEFORE splitting, so a Russian query tokenized to nothing at all
+# ("пороговое значение уровня жидкости" -> []). build_sparse_vector() then
+# returned an empty vector, and hybrid_search() only appends the sparse
+# prefetch `if sparse_vector.indices` — so every Russian query silently
+# degraded to dense-only search with no error anywhere.
+# No Russian stemming here deliberately: Qdrant applies IDF server-side
+# (Modifier.IDF), which already down-weights the ubiquitous forms a stop-word
+# list would remove, and real morphology is a separate, heavier decision.
+_TOKEN_RE = re.compile(r"[^\W_]+(?:-[^\W_]+)*")
+
+
 def _stem(token: str) -> str:
     for suffix in ("ment", "tion", "ing", "ness", "ies", "ied", "ed", "er", "ly", "es", "s"):
         if token.endswith(suffix) and len(token) - len(suffix) >= 4:
@@ -44,9 +59,16 @@ def _stem(token: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
-    """Lowercase, strip punctuation, remove stop words, stem."""
-    lowered = text.lower()
-    tokens = re.sub(r"[^a-z0-9\s]", " ", lowered).split()
+    """Lowercase, split on non-alphanumerics (any script), remove stop words, stem."""
+    tokens: list[str] = []
+    for match in _TOKEN_RE.finditer(text.lower()):
+        token = match.group()
+        tokens.append(token)
+        if "-" in token:
+            # Index the parts alongside the whole, so "A016ISMT-901" is
+            # findable by a query writing only "A016ISMT" (and the reverse) —
+            # a hyphenated identifier is routinely cited both ways.
+            tokens.extend(part for part in token.split("-") if part)
     return [_stem(t) for t in tokens if len(t) > 1 and t not in STOP_WORDS]
 
 
