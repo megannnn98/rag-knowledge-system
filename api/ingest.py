@@ -66,6 +66,8 @@ async def ingest_parsed_document(
     folder: str,
     doc_format: str,
     identity_key: str,
+    context_prefix: str = "",
+    payload_metadata: dict | None = None,
 ) -> dict:
     """Chunk, embed, upsert to Qdrant, then commit to Postgres — in that
     order, because the Postgres commit is what makes the document visible to
@@ -73,9 +75,15 @@ async def ingest_parsed_document(
     the vectors behind it are missing.
 
     `identity_key` is what goes into the file_hashes table: an uploaded
-    file's md5, or `confluence:<page_id>` for a synced page. Whatever it is,
-    it must be stable for the same logical document across re-ingestions —
-    that's what makes a duplicate detectable at all.
+    file's md5, or `confluence:page:<page_id>` / `confluence:comment:<id>`
+    for synced Confluence content. Whatever it is, it must be stable for the
+    same logical document across re-ingestions — that's what makes a
+    duplicate detectable at all.
+
+    `context_prefix` and `payload_metadata` let a source enrich retrieval
+    without a pipeline of its own: the first is prepended to each chunk for
+    embedding and reranking only, the second is copied onto every point's
+    Qdrant payload (see vector_db/qdrant_client.py::upsert_chunks).
 
     Raises ValueError when the document yields no chunks, and whatever
     db_save_ingestion raises (notably DuplicateFileHashError) untouched: the
@@ -96,6 +104,12 @@ async def ingest_parsed_document(
         chunk.filename = filename
         chunk.pages = parsed.total_pages
         chunk.folder = folder or ""
+        # Both are per-document, not per-chunk: context_prefix is what
+        # chunk_context_text() prepends for embedding/reranking (never for
+        # display), payload_metadata is what ends up queryable in Qdrant.
+        # Empty for PDF/TXT, which keeps their behaviour exactly as it was.
+        chunk.context_prefix = context_prefix
+        chunk.metadata = payload_metadata or None
 
     texts = [chunk_context_text(c) for c in chunks]
     t_embed = time.time()

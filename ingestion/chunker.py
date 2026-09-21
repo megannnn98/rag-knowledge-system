@@ -28,25 +28,41 @@ def normalize_whitespace(text: str) -> str:
 
 
 def chunk_context_text(chunk) -> str:
-    """Prepends a short document-level context (the descriptive filename,
-    underscores -> spaces) to a chunk's text — 'contextual retrieval'
-    (Anthropic). Many chunks, especially short heavily-templated legal
-    boilerplate ("Heard learned counsel for the petitioner...", near-
-    identical across many different case documents), carry almost no
-    signal on their own distinguishing which document they came from. Use
-    this for what gets embedded/indexed/reranked, never for what gets
-    stored/shown — chunk.text itself stays untouched so char_start/char_end
-    offsets and displayed excerpts remain exact.
+    """Prepends a short document-level context to a chunk's text —
+    'contextual retrieval' (Anthropic). Many chunks, especially short
+    heavily-templated legal boilerplate ("Heard learned counsel for the
+    petitioner...", near-identical across many different case documents),
+    carry almost no signal on their own distinguishing which document they
+    came from. Use this for what gets embedded/indexed/reranked, never for
+    what gets stored/shown — chunk.text itself stays untouched so
+    char_start/char_end offsets and displayed excerpts remain exact.
+
+    Two forms of context, in priority order:
+
+      - `context_prefix`, a multi-line block a source can supply when the
+        filename alone is too thin. Confluence sets it to the project, page
+        title and path (see ingestion/confluence/adapter.py): a chunk of
+        "BOM" three levels under "A174. Гидроснаб" contains no trace of
+        which project it belongs to, so "компоненты A174" could never match
+        it on its own words, and "Требования" exists under many projects at
+        once.
+      - otherwise the descriptive filename (underscores -> spaces), which is
+        what PDF/TXT uploads have always used — unchanged for them, since
+        they never set context_prefix.
 
     Accepts both TextChunk-like objects (ingestion) and the plain dicts
-    retrieval/reranking pass around (Qdrant hits carry "filename"/"text"
-    keys, not attributes)."""
+    retrieval/reranking pass around (Qdrant hits carry "filename"/"text"/
+    "context_prefix" keys, not attributes)."""
     if isinstance(chunk, dict):
         filename = chunk.get("filename", "") or ""
+        context_prefix = chunk.get("context_prefix", "") or ""
         text = chunk["text"]
     else:
         filename = getattr(chunk, "filename", "") or ""
+        context_prefix = getattr(chunk, "context_prefix", "") or ""
         text = chunk.text
+    if context_prefix:
+        return f"{context_prefix}\n\n{text}"
     title = Path(filename).stem.replace("_", " ") if filename else ""
     return f"{title}: {text}" if title else text
 
@@ -157,6 +173,14 @@ class TextChunk:
     # the exact cited passage, no text search against a rendered page needed.
     char_start: Optional[int] = None
     char_end: Optional[int] = None
+    # Source-supplied retrieval context (project/page/path for Confluence).
+    # Used by chunk_context_text() for embedding and reranking only; never
+    # stored as the chunk's text and never shown to the user.
+    context_prefix: str = ""
+    # Extra payload fields this chunk's source wants queryable in Qdrant
+    # (content_type, project, page_id, ... — see
+    # vector_db/qdrant_client.py::upsert_chunks). Empty for PDF/TXT.
+    metadata: Optional[dict] = None
 
 
 class SmartChunker:

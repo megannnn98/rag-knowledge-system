@@ -53,6 +53,22 @@ class ConfluenceNotFoundError(ConfluenceClientError):
 
 
 @dataclass(frozen=True)
+class ConfluenceComment:
+    """One comment on a page. `url` is Confluence's own permalink, which
+    carries focusedCommentId so a citation lands on the comment itself rather
+    than the top of a long page."""
+    id: str
+    page_id: str
+    version: int
+    url: str
+    html_content: str
+    text_content: str
+    author: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
 class ConfluencePage:
     """One Confluence page as this codebase needs it. `html_content` is the
     raw Confluence Storage Format body; `text_content` is that body after
@@ -156,6 +172,51 @@ class ConfluenceClient:
             start += len(results)
         return pages if limit is None else pages[:limit]
 
+    async def list_child_pages(self, page_id: str) -> list[ConfluencePage]:
+        """Direct children of a page, in Confluence's own order.
+
+        This instance's /descendant/page endpoint answers HTTP 500, so a tree
+        sync recurses through this one level at a time (see
+        api/confluence.py::walk_tree). Bodies are not expanded — same reason
+        list_pages() doesn't expand them: the version alone decides whether a
+        page needs downloading at all."""
+        return [
+            self._page_from_api(item)
+            for item in await self._paginate(f"/rest/api/content/{page_id}/child/page",
+                                             {"expand": "version,space"})
+        ]
+
+    async def list_comments(self, page_id: str) -> list[ConfluenceComment]:
+        """Comments on a page. Bodies ARE expanded here: a comment is small,
+        and unlike a page there is no cheaper signal that would tell us
+        whether it changed without reading it."""
+        return [
+            self._comment_from_api(item, page_id)
+            for item in await self._paginate(f"/rest/api/content/{page_id}/child/comment",
+                                             {"expand": "body.storage,version,history.createdBy"})
+        ]
+
+    async def _paginate(self, path: str, params: dict[str, str]) -> list[dict[str, Any]]:
+        """Follows `_links.next` until the server stops offering one.
+
+        Trusting `_links.next` rather than comparing `size` to `limit` is
+        deliberate: Confluence omits results the caller cannot view, so a page
+        of fewer items than requested does NOT mean the listing is finished."""
+        results: list[dict[str, Any]] = []
+        start = 0
+        while True:
+            page_params = dict(params)
+            page_params.update({"limit": str(self._api_page_size), "start": str(start)})
+            data = await self._request_json("GET", path, params=page_params)
+            batch = data.get("results", [])
+            if not isinstance(batch, list) or not batch:
+                return results
+            results.extend(item for item in batch if isinstance(item, dict))
+            links = data.get("_links")
+            if not isinstance(links, dict) or "next" not in links:
+                return results
+            start += len(batch)
+
     async def _request_json(self, method: str, path: str, *, params: dict[str, str]) -> dict[str, Any]:
         client = self._ensure_client()
         url = urljoin(f"{self._base_url}/", path.lstrip("/"))
@@ -225,6 +286,33 @@ class ConfluenceClient:
             version=version_number,
             html_content=html_content,
             text_content=self._parser.parse(html_content) if html_content else "",
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def _comment_from_api(self, data: dict[str, Any], page_id: str) -> ConfluenceComment:
+        comment_id = str(data.get("id", ""))
+        version = data.get("version")
+        history = data.get("history")
+        links = data.get("_links")
+
+        html_content = self._extract_html(data.get("body"))
+        version_number = int(version.get("number", 0)) if isinstance(version, dict) else 0
+        updated_at = self._parse_datetime(version.get("when")) if isinstance(version, dict) else None
+        created_by = (history or {}).get("createdBy") if isinstance(history, dict) else None
+        author = str(created_by.get("displayName", "")) or None if isinstance(created_by, dict) else None
+        created_at = self._parse_datetime(history.get("createdDate")) if isinstance(history, dict) else None
+        webui = str(links.get("webui", "")) if isinstance(links, dict) else ""
+        url = urljoin(f"{self._base_url}/", webui.lstrip("/")) if webui else ""
+
+        return ConfluenceComment(
+            id=comment_id,
+            page_id=page_id,
+            version=version_number,
+            url=url,
+            html_content=html_content,
+            text_content=self._parser.parse(html_content) if html_content else "",
+            author=author,
             created_at=created_at,
             updated_at=updated_at,
         )

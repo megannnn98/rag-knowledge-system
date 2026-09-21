@@ -58,10 +58,19 @@ def _source_origin(doc_id: str) -> dict:
 
     doc = m.documents_registry.get(doc_id) or {}
     meta = doc.get("metadata") or {}
-    origin = {"title": doc.get("filename", ""), "source": meta.get("source", "upload")}
+    origin = {
+        "title": meta.get("page_title") or doc.get("filename", ""),
+        "source": meta.get("source", "upload"),
+        # "page" | "comment" for Confluence, absent for uploads — the UI uses
+        # it to mark a citation that came from a discussion rather than from
+        # the page's own body.
+        "content_type": meta.get("content_type", ""),
+        "project": meta.get("project", ""),
+        "page_path": meta.get("page_path", ""),
+    }
     if meta.get("source") == "confluence" and meta.get("confluence_url"):
         origin["url"] = meta["confluence_url"]
-    return origin
+    return {k: v for k, v in origin.items() if v not in ("", None)}
 
 
 def _augment_compare_queries(expanded_queries: list[str], document_ids: list[str] | None) -> list[str]:

@@ -30,7 +30,9 @@ API = os.getenv("RAG_API_URL", "http://localhost:8000")
 
 
 def _label(hit: dict) -> str:
-    return f"{(hit.get('filename') or '?')[:44]:44s} c{hit.get('chunk_index', 0):<3d}"
+    kind = (hit.get("content_type") or "")[:7]
+    project = (hit.get("project") or "")[:22]
+    return f"[{kind:7s}] {project:24s} {(hit.get('filename') or '?')[:34]:36s} c{hit.get('chunk_index', 0):<3d}"
 
 
 def main(queries: list[str]) -> None:
@@ -74,8 +76,7 @@ def main(queries: list[str]) -> None:
         ).points if sparse.indices else []
         print(f"\n--- 4. sparse BM25 candidates (top {min(5, len(sparse_hits))} of {len(sparse_hits)}) ---")
         for point in sparse_hits[:5]:
-            payload = point.payload or {}
-            print(f"   {point.score:.4f}  {(payload.get('filename') or '?')[:44]:44s} c{payload.get('chunk_index', 0):<3d}")
+            print(f"   {point.score:.4f}  {_label(point.payload or {})}")
         if not sparse.indices:
             print("   (none — query produced an empty sparse vector)")
 
@@ -103,7 +104,8 @@ def main(queries: list[str]) -> None:
         print(textwrap.indent(answer.get("answer", ""), "   "))
         print("\n--- 10. sources ---")
         for source in answer.get("sources", []):
-            print(f"   {source['relevance_score']:.3f}  {source.get('title', '?')}")
+            kind = source.get("content_type", "")
+            print(f"   {source['relevance_score']:.3f}  [{kind}] {source.get('project','')} :: {source.get('title', '?')}")
             print(f"          {source.get('url', '(local document)')}")
             print(f"          {source.get('excerpt', '')[:110]}")
 

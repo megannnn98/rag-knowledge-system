@@ -99,6 +99,23 @@ _PAYLOAD_INDEXES = (
     # "Regulation No 780/2007", had no structured index before this).
     ("citation_number", PayloadSchemaType.KEYWORD),
     ("citation_year", PayloadSchemaType.KEYWORD),
+    # Confluence structure. Indexed now, ahead of any UI that filters on
+    # them, precisely so that adding `project == "A174. Гидроснаб"` or
+    # `content_type == "comment"` later is a query change and not a
+    # re-indexing of the whole corpus.
+    ("content_type", PayloadSchemaType.KEYWORD),
+    ("project", PayloadSchemaType.KEYWORD),
+    ("page_id", PayloadSchemaType.KEYWORD),
+)
+
+# Source-supplied payload fields copied verbatim from a chunk's metadata onto
+# every one of its points. Restricted to a fixed list rather than merging the
+# whole dict: payload keys become part of the collection's schema, and an
+# unbounded merge would let any future source silently add fields (and
+# unindexed filter targets) nobody chose.
+_METADATA_PAYLOAD_FIELDS = (
+    "source", "content_type", "project", "project_code", "project_name",
+    "page_id", "page_title", "page_path", "page_url", "space_key", "comment_id",
 )
 
 
@@ -216,6 +233,18 @@ class VectorStore:
                     "celex_id": celex_id or "",
                     "citation_number": citation_meta.get("citation_number", ""),
                     "citation_year": citation_meta.get("citation_year", ""),
+                    # Retrieval context (project/page/path for Confluence).
+                    # Stored so reranking sees the same string embedding did —
+                    # rag/reranker.py re-runs chunk_context_text() on these
+                    # payload dicts, and without this the reranker would score
+                    # a bare chunk while the vector was built from a
+                    # contextualised one.
+                    "context_prefix": getattr(chunk, "context_prefix", "") or "",
+                    **{
+                        field: (getattr(chunk, "metadata", None) or {}).get(field)
+                        for field in _METADATA_PAYLOAD_FIELDS
+                        if (getattr(chunk, "metadata", None) or {}).get(field) is not None
+                    },
                 }
             ))
         batches = _batch_points_by_size(points, _MAX_UPSERT_BATCH_BYTES)
@@ -406,6 +435,8 @@ class VectorStore:
                 "celex_id": p.get("celex_id", ""),
                 "citation_number": p.get("citation_number", ""),
                 "citation_year": p.get("citation_year", ""),
+                "context_prefix": p.get("context_prefix", ""),
+                **{field: p[field] for field in _METADATA_PAYLOAD_FIELDS if field in p},
             })
         return out
 
@@ -444,6 +475,8 @@ class VectorStore:
                 "celex_id": p.get("celex_id", ""),
                 "citation_number": p.get("citation_number", ""),
                 "citation_year": p.get("citation_year", ""),
+                "context_prefix": p.get("context_prefix", ""),
+                **{field: p[field] for field in _METADATA_PAYLOAD_FIELDS if field in p},
             })
         return out
 

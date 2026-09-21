@@ -1116,14 +1116,19 @@ function buildSourcesColumn(sources) {
     const rawName = doc.filename || s.title || s.document || '?';
     const fname = rawName.replace(/\.pdf$/i, '');
     const isLink = !!s.url;
+    // A Confluence citation shows which project it came from, and marks a
+    // comment as such — the same page can contribute both its body and a
+    // discussion remark, and those are not equally authoritative.
+    const badge = s.content_type === 'comment' ? 'comment' : (s.project || '');
     html += '<div class="source-card" data-src="' + idx + '" role="button" tabindex="0">';
     html += '<div class="source-num">' + (i + 1) + '</div>';
     html += '<div class="source-body">';
-    html += '<div class="source-top"><span class="source-filename" title="' + esc(rawName) + '">' + esc(fname) + '</span>';
-    html += isLink ? '' : '<span class="source-page">p.' + (s.page || '?') + '</span>';
+    html += '<div class="source-top"><span class="source-filename" title="' + esc(s.page_path || rawName) + '">' + esc(fname) + '</span>';
+    html += isLink ? (badge ? '<span class="source-page">' + esc(badge) + '</span>' : '')
+                   : '<span class="source-page">p.' + (s.page || '?') + '</span>';
     html += '</div>';
     html += '<div class="source-excerpt">' + esc(s.excerpt || '') + '</div>';
-    html += '<div class="source-open">' + svgIcon('external-link', 11) + (isLink ? ' Open in Confluence' : ' Open document') + '</div>';
+    html += '<div class="source-open">' + svgIcon('external-link', 11) + (isLink ? (s.content_type === 'comment' ? ' Open comment in Confluence' : ' Open in Confluence') : ' Open document') + '</div>';
     html += '</div></div>';
   });
   html += '</div>';
